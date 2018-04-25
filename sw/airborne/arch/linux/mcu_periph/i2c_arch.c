@@ -34,6 +34,33 @@
 #include <linux/i2c-dev.h>
 #include <errno.h>
 
+#include <pthread.h>
+#include <sys/select.h>
+
+#include "rt_priority.h"
+
+#ifndef I2C_THREAD_PRIO
+#define I2C_THREAD_PRIO 10
+#endif
+
+static void *i2c_thread(void *data __attribute__((unused)));
+static pthread_mutex_t i2c_mutex = PTHREAD_MUTEX_INITIALIZER;
+bool thread_initialized = false;
+
+void i2c_complete_trans(struct i2c_periph *p);
+
+static void i2c_arch_init(void)
+{
+  pthread_mutex_init(&i2c_mutex, NULL);
+
+  pthread_t tid;
+  if (pthread_create(&tid, NULL, i2c_thread, NULL) != 0) {
+    fprintf(stderr, "i2c_arch_init: Could not create I2C thread.\n");
+    return;
+  }
+  thread_initialized = true;
+}
+
 void i2c_event(void)
 {
 }
@@ -47,9 +74,82 @@ bool i2c_idle(struct i2c_periph *p __attribute__((unused)))
   return true;
 }
 
+bool i2c_submit(struct i2c_periph *p, struct i2c_transaction *t)
+{
+  if (!thread_initialized)
+  {
+    i2c_arch_init();
+  }
+
+  uint8_t temp;
+  temp = (p->trans_insert_idx + 1) % I2C_TRANSACTION_QUEUE_LEN;
+  if (temp == p->trans_extract_idx) {
+    // queue full
+    p->errors->queue_full_cnt++;
+    t->status = I2CTransFailed;
+    return false;
+  }
+
+  t->status = I2CTransPending;
+
+  pthread_mutex_lock(&i2c_mutex);
+
+  /* put transaction in queue */
+  p->trans[p->trans_insert_idx] = t;
+  p->trans_insert_idx = temp;
+
+  pthread_mutex_unlock(&i2c_mutex);
+
+  return true;
+}
+
+/**
+ * check for new i2c transactions.
+ */
+static void *i2c_thread(void *data __attribute__((unused)))
+{
+  get_rt_prio(I2C_THREAD_PRIO);
+
+  while (1)
+  {
+#if USE_I2C0
+    if(i2c0.trans_insert_idx != i2c0.trans_extract_idx)
+    {
+      i2c_complete_trans(&i2c0);
+    }
+#endif
+
+#if USE_I2C1
+    if(i2c1.trans_insert_idx != i2c1.trans_extract_idx)
+    {
+      i2c_complete_trans(&i2c1);
+    }
+#endif
+
+#if USE_I2C2
+    if(i2c2.trans_insert_idx != i2c2.trans_extract_idx)
+    {
+      i2c_complete_trans(&i2c2);
+    }
+#endif
+
+#if USE_I2C3
+    if(i2c3.trans_insert_idx != i2c3.trans_extract_idx)
+    {
+      i2c_complete_trans(&i2c3)
+    }
+#endif
+    usleep(5);  // TODO: check if this is appropriate
+  }
+  return 0;
+}
+
+/*
+ * Complete requested transactions
+ */
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wcast-qual"
-bool i2c_submit(struct i2c_periph *p, struct i2c_transaction *t)
+void i2c_complete_trans(struct i2c_periph *p)
 {
   int file = (int)p->reg_addr;
 
@@ -58,6 +158,8 @@ bool i2c_submit(struct i2c_periph *p, struct i2c_transaction *t)
     .msgs = trx_msgs,
     .nmsgs = 2
   };
+
+  struct i2c_transaction *t = p->trans[p->trans_extract_idx];
   // Switch the different transaction types
   switch (t->type) {
       // Just transmitting
@@ -68,7 +170,7 @@ bool i2c_submit(struct i2c_periph *p, struct i2c_transaction *t)
         /* if write failed, increment error counter queue_full_cnt */
         p->errors->queue_full_cnt++;
         t->status = I2CTransFailed;
-        return true;
+        return;
       }
       break;
       // Just reading
@@ -79,7 +181,7 @@ bool i2c_submit(struct i2c_periph *p, struct i2c_transaction *t)
         /* if read failed, increment error counter ack_fail_cnt */
         p->errors->ack_fail_cnt++;
         t->status = I2CTransFailed;
-        return true;
+        return;
       }
       break;
       // First Transmit and then read with repeated start
@@ -96,19 +198,21 @@ bool i2c_submit(struct i2c_periph *p, struct i2c_transaction *t)
         /* if write/read failed, increment error counter miss_start_stop_cnt */
         p->errors->miss_start_stop_cnt++;
         t->status = I2CTransFailed;
-        return true;
+        return;
       }
       break;
     default:
       break;
   }
 
-  // Successfull transfer
+  // Successful transfer
   t->status = I2CTransSuccess;
-  return true;
+
+  pthread_mutex_lock(&i2c_mutex);
+  p->trans_extract_idx = (p->trans_extract_idx + 1) % I2C_TRANSACTION_QUEUE_LEN;
+  pthread_mutex_unlock(&i2c_mutex);
 }
 #pragma GCC diagnostic pop
-
 
 #if USE_I2C0
 struct i2c_errors i2c0_errors;
